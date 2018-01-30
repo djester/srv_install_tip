@@ -14,6 +14,7 @@
 
 #include <unistd.h>
 #include <sys/time.h>
+#include <syslog.h>
 
 #include "postgres.h"
 #include "libpq/libpq.h"
@@ -50,6 +51,27 @@ static char log_time[LOG_TIMESTAMP_LEN];
 
 static const char *error_severity(int elevel);
 static void write_jsonlog(ErrorData *edata);
+
+/*
+ *  * Max string length to send to syslog().  Note that this doesn't count the
+ *   * sequence-number prefix we add, and of course it doesn't count the prefix
+ *    * added by syslog itself.  Solaris and sysklogd truncate the final message
+ *     * at 1024 bytes, so this value leaves 124 bytes for those prefixes.  (Most
+ *      * other syslog implementations seem to have limits of 2KB or so.)
+ *       */
+
+#ifndef PG_SYSLOG_LIMIT
+#define PG_SYSLOG_LIMIT 900
+#endif
+
+static bool openlog_done = false;
+static char *syslog_ident = NULL;
+static int  syslog_facility = LOG_LOCAL0;
+
+static const char *syslog_dest = NULL;
+
+static void write_syslog(int level, const char *line);
+
 
 /*
  * error_severity
@@ -208,6 +230,112 @@ appendJSONLiteral(StringInfo buf, char *key, char *value, bool is_comma)
 }
 
 /*
+ *  * Write a message line to syslog
+ *  * func from elog.c from PostgreSQL src
+ *   */
+static void
+write_syslog(int level, const char *line)
+{
+    static unsigned long seq = 0;
+
+    int         len;
+    const char *nlpos;
+
+    /* Open syslog connection if not done yet */
+    if (!openlog_done)
+    {
+        openlog(syslog_ident ? syslog_ident : "postgres",
+                LOG_PID | LOG_NDELAY | LOG_NOWAIT,
+                syslog_facility);
+        openlog_done = true;
+    }
+
+    /*
+ *      * We add a sequence number to each log message to suppress "same"
+ *           * messages.
+ *                */
+    seq++;
+
+    /*
+ *      * Our problem here is that many syslog implementations don't handle long
+ *           * messages in an acceptable manner. While this function doesn't help that
+ *                * fact, it does work around by splitting up messages into smaller pieces.
+ *                     *
+ *                          * We divide into multiple syslog() calls if message is too long or if the
+ *                               * message contains embedded newline(s).
+ *                                    */
+    len = strlen(line);
+    nlpos = strchr(line, '\n');
+    if (len > PG_SYSLOG_LIMIT || nlpos != NULL)
+    {
+        int         chunk_nr = 0;
+
+        while (len > 0)
+        {
+            char        buf[PG_SYSLOG_LIMIT + 1];
+            int         buflen;
+            int         i;
+
+            /* if we start at a newline, move ahead one char */
+            if (line[0] == '\n')
+            {
+                line++;
+                len--;
+                /* we need to recompute the next newline's position, too */
+                nlpos = strchr(line, '\n');
+                continue;
+            }
+
+            /* copy one line, or as much as will fit, to buf */
+            if (nlpos != NULL)
+                buflen = nlpos - line;
+            else
+                buflen = len;
+            buflen = Min(buflen, PG_SYSLOG_LIMIT);
+            memcpy(buf, line, buflen);
+            buf[buflen] = '\0';
+
+            /* trim to multibyte letter boundary */
+            buflen = pg_mbcliplen(buf, buflen, buflen);
+            if (buflen <= 0)
+                return;
+            buf[buflen] = '\0';
+
+            /* already word boundary? */
+            if (line[buflen] != '\0' &&
+                !isspace((unsigned char) line[buflen]))
+            {
+                /* try to divide at word boundary */
+                i = buflen - 1;
+                while (i > 0 && !isspace((unsigned char) buf[i]))
+                    i--;
+
+                if (i > 0)      /* else couldn't divide word boundary */
+                {
+                    buflen = i;
+                    buf[i] = '\0';
+                }
+            }
+
+            chunk_nr++;
+
+            syslog(level, "[%lu-%d] %s", seq, chunk_nr, buf);
+            line += buflen;
+            len -= buflen;
+        }
+    }
+    else
+    {
+        /* message short enough */
+         syslog(level, "[%lu] %s", seq, line);
+        //syslog(level, "%s", line);
+    }
+}
+
+
+
+
+/*
  * write_jsonlog
  * Write logs in json format.
  */
@@ -216,6 +344,12 @@ write_jsonlog(ErrorData *edata)
 {
 	StringInfoData	buf;
 	TransactionId	txid = GetTopTransactionIdIfAny();
+
+	/*
+ 	* Get Log_destination parameter value
+ 	*/  
+
+	syslog_dest = GetConfigOption("log_destination", false, false);
 
 	/*
 	 * Disable logs to server, we don't want duplicate entries in
@@ -235,120 +369,206 @@ write_jsonlog(ErrorData *edata)
 	/* Initialize string */
 	appendStringInfoChar(&buf, '{');
 
-	/* Timestamp */
-	if (log_time[0] == '\0')
-		setup_formatted_log_time();
-	appendJSONLiteral(&buf, "timestamp", log_time, true);
-
-	/* Username */
-	if (MyProcPort && MyProcPort->user_name)
-		appendJSONLiteral(&buf, "user", MyProcPort->user_name, true);
-
-	/* Database name */
-	if (MyProcPort && MyProcPort->database_name)
-		appendJSONLiteral(&buf, "dbname", MyProcPort->database_name, true);
-
-	/* Process ID */
-	if (MyProcPid != 0)
-		appendStringInfo(&buf, "\"pid\":%d,", MyProcPid);
-
-	/* Remote host and port */
-	if (MyProcPort && MyProcPort->remote_host)
+	if (strcmp(syslog_dest,"syslog") == 0)
 	{
-		appendJSONLiteral(&buf, "remote_host",
-						  MyProcPort->remote_host, true);
-		if (MyProcPort->remote_port && MyProcPort->remote_port[0] != '\0')
-			appendJSONLiteral(&buf, "remote_port",
-							  MyProcPort->remote_port, true);
-	}
+		/* Username */
+		if (MyProcPort && MyProcPort->user_name)
+			appendJSONLiteral(&buf, "user", MyProcPort->user_name, true);
 
-	/* Session id */
-	if (MyProcPid != 0)
-		appendStringInfo(&buf, "\"session_id\":\"%lx.%x\",",
-						 (long) MyStartTime, MyProcPid);
+		/* Database name */
+		if (MyProcPort && MyProcPort->database_name)
+			appendJSONLiteral(&buf, "dbname", MyProcPort->database_name, true);
 
-	/* Virtual transaction id */
-	/* keep VXID format in sync with lockfuncs.c */
-	if (MyProc != NULL && MyProc->backendId != InvalidBackendId)
-		appendStringInfo(&buf, "\"vxid\":\"%d/%u\",",
-						 MyProc->backendId, MyProc->lxid);
+                /* Session id */
+                if (MyProcPid != 0)
+                        appendStringInfo(&buf, "\"session_id\":\"%lx.%x\",",
+                                                         (long) MyStartTime, MyProcPid);
 
-	/* Transaction id */
-	if (txid != InvalidTransactionId)
-		appendStringInfo(&buf, "\"txid\":%u,", GetTopTransactionIdIfAny());
+                /* Virtual transaction id */
+                /* keep VXID format in sync with lockfuncs.c */
+                if (MyProc != NULL && MyProc->backendId != InvalidBackendId)
+                        appendStringInfo(&buf, "\"vxid\":\"%d/%u\",",
+                                                         MyProc->backendId, MyProc->lxid);
 
-	/* Error severity */
-	appendJSONLiteral(&buf, "error_severity",
-					  (char *) error_severity(edata->elevel), true);
+                /* Transaction id */
+                if (txid != InvalidTransactionId)
+                        appendStringInfo(&buf, "\"txid\":%u,", GetTopTransactionIdIfAny());
 
-	/* SQL state code */
-	if (edata->sqlerrcode != ERRCODE_SUCCESSFUL_COMPLETION)
-		appendJSONLiteral(&buf, "state_code",
-						  unpack_sql_state(edata->sqlerrcode), true);
+                /* SQL state code */
+                if (edata->sqlerrcode != ERRCODE_SUCCESSFUL_COMPLETION)
+                        appendJSONLiteral(&buf, "state_code",
+                                                          unpack_sql_state(edata->sqlerrcode), true);
 
-	/* Error detail or Error detail log */
-	if (edata->detail_log)
-		appendJSONLiteral(&buf, "detail_log", edata->detail_log, true);
-	else if (edata->detail)
-		appendJSONLiteral(&buf, "detail", edata->detail, true);
+                /* Error detail or Error detail log */
+                if (edata->detail_log)
+                        appendJSONLiteral(&buf, "detail_log", edata->detail_log, true);
+                else if (edata->detail)
+                        appendJSONLiteral(&buf, "detail", edata->detail, true);
 
-	/* Error hint */
-	if (edata->hint)
-		appendJSONLiteral(&buf, "hint", edata->hint, true);
+                /* Error hint */
+                if (edata->hint)
+                        appendJSONLiteral(&buf, "hint", edata->hint, true);
 
-	/* Internal query */
-	if (edata->internalquery)
-		appendJSONLiteral(&buf, "internal_query",
-						  edata->internalquery, true);
+                /* Internal query */
+                if (edata->internalquery)
+                        appendJSONLiteral(&buf, "internal_query",
+                                                          edata->internalquery, true);
 
-	/* Error context */
-	if (edata->context)
-		appendJSONLiteral(&buf, "context", edata->context, true);
+                /* Error context */
+                if (edata->context)
+                        appendJSONLiteral(&buf, "context", edata->context, true);
 
-	/* File error location */
-	if (Log_error_verbosity >= PGERROR_VERBOSE)
+                /* File error location */
+                if (Log_error_verbosity >= PGERROR_VERBOSE)
+                {
+                        StringInfoData msgbuf;
+
+                        initStringInfo(&msgbuf);
+
+                        if (edata->funcname && edata->filename)
+                                appendStringInfo(&msgbuf, "%s, %s:%d",
+                                                                 edata->funcname, edata->filename,
+                                                                 edata->lineno);
+                        else if (edata->filename)
+                                appendStringInfo(&msgbuf, "%s:%d",
+                                                                 edata->filename, edata->lineno);
+                        appendJSONLiteral(&buf, "file_location", msgbuf.data, true);
+                        pfree(msgbuf.data);
+                }
+
+                /* Application name */
+                if (application_name && application_name[0] != '\0')
+                        appendJSONLiteral(&buf, "application_name",
+                                                          application_name, true);
+
+
+		/* Error message */
+		appendJSONLiteral(&buf, "message", edata->message, false);
+
+		/* Finish string */
+		appendStringInfoChar(&buf, '}');
+		appendStringInfoChar(&buf, '\n');
+
+	//	write_syslog(edata->elevel, edata->message);
+		write_syslog(edata->elevel, buf.data);
+
+	} else
 	{
-		StringInfoData msgbuf;
 
-		initStringInfo(&msgbuf);
+		/* Timestamp */
+		if (log_time[0] == '\0')
+			setup_formatted_log_time();
+		appendJSONLiteral(&buf, "timestamp", log_time, true);
 
-		if (edata->funcname && edata->filename)
-			appendStringInfo(&msgbuf, "%s, %s:%d",
-							 edata->funcname, edata->filename,
-							 edata->lineno);
-		else if (edata->filename)
-			appendStringInfo(&msgbuf, "%s:%d",
-							 edata->filename, edata->lineno);
-		appendJSONLiteral(&buf, "file_location", msgbuf.data, true);
-		pfree(msgbuf.data);
+		/* Username */
+		if (MyProcPort && MyProcPort->user_name)
+			appendJSONLiteral(&buf, "user", MyProcPort->user_name, true);
+
+		/* Database name */
+		if (MyProcPort && MyProcPort->database_name)
+			appendJSONLiteral(&buf, "dbname", MyProcPort->database_name, true);
+
+		/* Process ID */
+		if (MyProcPid != 0)
+			appendStringInfo(&buf, "\"pid\":%d,", MyProcPid);
+
+		/* Remote host and port */
+		if (MyProcPort && MyProcPort->remote_host)
+		{
+			appendJSONLiteral(&buf, "remote_host",
+							  MyProcPort->remote_host, true);
+			if (MyProcPort->remote_port && MyProcPort->remote_port[0] != '\0')
+				appendJSONLiteral(&buf, "remote_port",
+								  MyProcPort->remote_port, true);
+		}
+
+		/* Session id */
+		if (MyProcPid != 0)
+			appendStringInfo(&buf, "\"session_id\":\"%lx.%x\",",
+							 (long) MyStartTime, MyProcPid);
+
+		/* Virtual transaction id */
+		/* keep VXID format in sync with lockfuncs.c */
+		if (MyProc != NULL && MyProc->backendId != InvalidBackendId)
+			appendStringInfo(&buf, "\"vxid\":\"%d/%u\",",
+							 MyProc->backendId, MyProc->lxid);
+
+		/* Transaction id */
+		if (txid != InvalidTransactionId)
+			appendStringInfo(&buf, "\"txid\":%u,", GetTopTransactionIdIfAny());
+
+		/* Error severity */
+		appendJSONLiteral(&buf, "error_severity",
+						  (char *) error_severity(edata->elevel), true);
+
+		/* SQL state code */
+		if (edata->sqlerrcode != ERRCODE_SUCCESSFUL_COMPLETION)
+			appendJSONLiteral(&buf, "state_code",
+							  unpack_sql_state(edata->sqlerrcode), true);
+
+		/* Error detail or Error detail log */
+		if (edata->detail_log)
+			appendJSONLiteral(&buf, "detail_log", edata->detail_log, true);
+		else if (edata->detail)
+			appendJSONLiteral(&buf, "detail", edata->detail, true);
+
+		/* Error hint */
+		if (edata->hint)
+			appendJSONLiteral(&buf, "hint", edata->hint, true);
+
+		/* Internal query */
+		if (edata->internalquery)
+			appendJSONLiteral(&buf, "internal_query",
+							  edata->internalquery, true);
+
+		/* Error context */
+		if (edata->context)
+			appendJSONLiteral(&buf, "context", edata->context, true);
+
+		/* File error location */
+		if (Log_error_verbosity >= PGERROR_VERBOSE)
+		{	
+			StringInfoData msgbuf;
+
+			initStringInfo(&msgbuf);
+
+			if (edata->funcname && edata->filename)
+				appendStringInfo(&msgbuf, "%s, %s:%d",
+								 edata->funcname, edata->filename,
+								 edata->lineno);
+			else if (edata->filename)
+				appendStringInfo(&msgbuf, "%s:%d",
+								 edata->filename, edata->lineno);
+			appendJSONLiteral(&buf, "file_location", msgbuf.data, true);
+			pfree(msgbuf.data);
+		}
+
+		/* Application name */
+		if (application_name && application_name[0] != '\0')
+			appendJSONLiteral(&buf, "application_name",
+							  application_name, true);
+
+		/* Error message */
+		appendJSONLiteral(&buf, "message", edata->message, false);
+
+		/* Finish string */
+		appendStringInfoChar(&buf, '}');
+		appendStringInfoChar(&buf, '\n');
+
+		/* Write to stderr, if enabled */
+	        if ((Log_destination & LOG_DESTINATION_STDERR) != 0) 
+        	//if ((Log_destination & LOG_DESTINATION_SYSLOG) != 0) 
+		{
+			if (Logging_collector && redirection_done && !am_syslogger)
+				write_pipe_chunks(buf.data, buf.len);
+			else
+				write_console(buf.data, buf.len);
+		}
+	
+		/* If in the syslogger process, try to write messages direct to file */
+		if (am_syslogger)
+			write_syslogger_file(buf.data, buf.len, LOG_DESTINATION_STDERR);
 	}
-
-	/* Application name */
-	if (application_name && application_name[0] != '\0')
-		appendJSONLiteral(&buf, "application_name",
-						  application_name, true);
-
-	/* Error message */
-	appendJSONLiteral(&buf, "message", edata->message, false);
-
-	/* Finish string */
-	appendStringInfoChar(&buf, '}');
-	appendStringInfoChar(&buf, '\n');
-
-	/* Write to stderr, if enabled */
-        if ((Log_destination & LOG_DESTINATION_STDERR) != 0) 
-        //if ((Log_destination & LOG_DESTINATION_SYSLOG) != 0) 
-	{
-		if (Logging_collector && redirection_done && !am_syslogger)
-			write_pipe_chunks(buf.data, buf.len);
-		else
-			write_console(buf.data, buf.len);
-	}
-
-	/* If in the syslogger process, try to write messages direct to file */
-	if (am_syslogger)
-	//	write_syslogger_file(buf.data, buf.len, LOG_DESTINATION_STDERR);
-		write_syslog(edata->elevel, edata->message);
 
 	/* Cleanup */
 	pfree(buf.data);
