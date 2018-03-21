@@ -21,8 +21,8 @@ tar -zxf zookeeper-3.4.10.tar.gz -C /opt/
 ln -s /opt/zookeeper-3.4.10 /opt/zookeeper
 
 cat > /etc/profile.d/zookeeper.sh <<EOF
-export PATH=/opt/zookeeper:/opt/zookeeper/bin:$PATH
-export ZOOKEEEPER_HOME=/opt/zookeeper:$ZOOKEEEPER_HOME/bin
+export PATH=/opt/zookeeper:/opt/zookeeper/bin:\$PATH
+export ZOOKEEEPER_HOME=/opt/zookeeper:\$ZOOKEEEPER_HOME/bin
 EOF
 
 # Create group with system GUID 
